@@ -14,25 +14,51 @@ import fs from 'fs';
 
 dotenv.config();
 
-// Path for persistent admin credentials
+// Path for persistent admin credentials (uses /tmp if on read-only serverless environment)
 const CREDENTIALS_FILE = path.resolve('admin_credentials.json');
 
 // Initialize with default or env-configured credentials
 let currentAdminEmail = process.env.ADMIN_EMAIL || 'adnaneauto@gmail.com';
 let currentAdminPassword = process.env.ADMIN_PASSWORD || '%*2vX#AnD?//weEE$';
 
+// Helper to safely write JSON files (falls back to /tmp or catches read-only filesystem errors on Vercel)
+function safeWriteJSONFile(filename: string, data: any) {
+  const content = JSON.stringify(data, null, 2);
+  try {
+    fs.writeFileSync(path.resolve(filename), content, 'utf-8');
+  } catch (err) {
+    try {
+      fs.writeFileSync(path.join('/tmp', path.basename(filename)), content, 'utf-8');
+    } catch (tmpErr) {
+      console.warn(`[Adnane Auto FS] File write skipped for ${filename} (serverless read-only filesystem)`);
+    }
+  }
+}
+
+// Helper to safely read JSON files
+function safeReadJSONFile(filename: string): any {
+  try {
+    const targetPath = path.resolve(filename);
+    if (fs.existsSync(targetPath)) {
+      return JSON.parse(fs.readFileSync(targetPath, 'utf-8'));
+    }
+    const tmpPath = path.join('/tmp', path.basename(filename));
+    if (fs.existsSync(tmpPath)) {
+      return JSON.parse(fs.readFileSync(tmpPath, 'utf-8'));
+    }
+  } catch (err) {
+    console.warn(`[Adnane Auto FS] File read skipped for ${filename}:`, err);
+  }
+  return null;
+}
+
 // Try to load saved credentials
 try {
-  if (fs.existsSync(CREDENTIALS_FILE)) {
-    const rawData = fs.readFileSync(CREDENTIALS_FILE, 'utf-8');
-    const parsed = JSON.parse(rawData);
-    if (parsed.email) {
-      currentAdminEmail = parsed.email;
-    }
-    if (parsed.password) {
-      currentAdminPassword = parsed.password;
-    }
-    console.log('[Adnane Auto Server] Loaded custom credentials from file.');
+  const parsed = safeReadJSONFile('admin_credentials.json');
+  if (parsed) {
+    if (parsed.email) currentAdminEmail = parsed.email;
+    if (parsed.password) currentAdminPassword = parsed.password;
+    console.log('[Adnane Auto Server] Loaded custom credentials.');
   }
 } catch (err) {
   console.error('[Adnane Auto Server] Failed to load admin credentials:', err);
@@ -42,21 +68,15 @@ try {
 const activeAdminSessions = new Set<string>();
 
 // Security Intrusion Engine & Banned IPs
-const BANNED_IPS_FILE = path.resolve('banned_ips.json');
-const INTRUSION_LOGS_FILE = path.resolve('intrusion_logs.json');
-
 let bannedIPs = new Set<string>();
 let intrusionLogs: any[] = [];
 const failedLoginAttempts: Record<string, { count: number; lastAttempt: number }> = {};
 
 // Load Banned IPs
 try {
-  if (fs.existsSync(BANNED_IPS_FILE)) {
-    const raw = fs.readFileSync(BANNED_IPS_FILE, 'utf-8');
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) {
-      bannedIPs = new Set(parsed);
-    }
+  const parsed = safeReadJSONFile('banned_ips.json');
+  if (Array.isArray(parsed)) {
+    bannedIPs = new Set(parsed);
   }
 } catch (e) {
   console.error('[Security] Failed to load banned IPs:', e);
@@ -64,12 +84,9 @@ try {
 
 // Load Intrusion Logs
 try {
-  if (fs.existsSync(INTRUSION_LOGS_FILE)) {
-    const raw = fs.readFileSync(INTRUSION_LOGS_FILE, 'utf-8');
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed)) {
-      intrusionLogs = parsed;
-    }
+  const parsed = safeReadJSONFile('intrusion_logs.json');
+  if (Array.isArray(parsed)) {
+    intrusionLogs = parsed;
   }
 } catch (e) {
   console.error('[Security] Failed to load intrusion logs:', e);
@@ -77,21 +94,13 @@ try {
 
 // Helper to save banned IPs
 function saveBannedIPs() {
-  try {
-    fs.writeFileSync(BANNED_IPS_FILE, JSON.stringify(Array.from(bannedIPs), null, 2), 'utf-8');
-  } catch (e) {
-    console.error('[Security] Failed to save banned IPs:', e);
-  }
+  safeWriteJSONFile('banned_ips.json', Array.from(bannedIPs));
 }
 
 // Helper to save logs
 function saveIntrusionLogs() {
-  try {
-    const trimmed = intrusionLogs.slice(-1000); // Bounded size
-    fs.writeFileSync(INTRUSION_LOGS_FILE, JSON.stringify(trimmed, null, 2), 'utf-8');
-  } catch (e) {
-    console.error('[Security] Failed to save intrusion logs:', e);
-  }
+  const trimmed = intrusionLogs.slice(-1000); // Bounded size
+  safeWriteJSONFile('intrusion_logs.json', trimmed);
 }
 
 // Get client IP address accurately
@@ -327,8 +336,20 @@ app.use(helmet({
 // Disable powered-by disclosure
 app.disable('x-powered-by');
 
-// 2. Limit request payload size to guard against buffer floods
-app.use(express.json({ limit: '15kb' }));
+// 2. Safe request body parsing (prevents stream re-read errors on Vercel)
+app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (req.body && (typeof req.body === 'object' || Array.isArray(req.body))) {
+    return next();
+  }
+  express.json({ limit: '50kb' })(req, res, (err) => {
+    if (err) {
+      console.warn('[Adnane Auto BodyParser Warning]:', err?.message || err);
+      req.body = req.body || {};
+      return next();
+    }
+    next();
+  });
+});
 
   // 2b. Security Intrusion Detection & IP Ban Guard Middleware
   app.use((req, res, next) => {
@@ -445,8 +466,18 @@ app.use(express.json({ limit: '15kb' }));
     }
 
     // 2. Deep Payload Analysis (SQL/XSS checks) on Body and Query parameters
-    const bodyStr = JSON.stringify(req.body || {});
-    const queryStr = JSON.stringify(req.query || {});
+    let bodyStr = '';
+    let queryStr = '';
+    try {
+      bodyStr = typeof req.body === 'string' ? req.body : JSON.stringify(req.body || {});
+    } catch (e) {
+      bodyStr = '';
+    }
+    try {
+      queryStr = typeof req.query === 'string' ? req.query : JSON.stringify(req.query || {});
+    } catch (e) {
+      queryStr = '';
+    }
 
     const bodyAudit = analyzePayloadSecurity(bodyStr);
     const queryAudit = analyzePayloadSecurity(queryStr);
@@ -502,28 +533,53 @@ app.use(express.json({ limit: '15kb' }));
     next();
   });
 
+  // Helper to safely execute rate limiting without crashing serverless instances
+  const createSafeLimiter = (options: any) => {
+    try {
+      const limiter = rateLimit({
+        ...options,
+        validate: false,
+      });
+      return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+        try {
+          limiter(req, res, (err: any) => {
+            if (err) {
+              console.warn('[RateLimiter Error skipped]:', err?.message || err);
+              return next();
+            }
+            next();
+          });
+        } catch (e) {
+          console.warn('[RateLimiter Exception skipped]:', e);
+          next();
+        }
+      };
+    } catch (e) {
+      console.warn('[RateLimiter Init Exception]:', e);
+      return (req: express.Request, res: express.Response, next: express.NextFunction) => next();
+    }
+  };
+
   // 3. General Rate Limiter (max 2000 requests per 15 minutes per IP, skip loopback)
-  const generalLimiter = rateLimit({
+  const generalLimiter = createSafeLimiter({
     windowMs: 15 * 60 * 1000, 
     max: 2000,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => getClientIP(req),
-    skip: (req) => isLoopbackIP(getClientIP(req)) || !req.path.startsWith('/api'),
-    validate: false,
+    keyGenerator: (req: express.Request) => getClientIP(req),
+    skip: (req: express.Request) => isLoopbackIP(getClientIP(req)) || !req.path.startsWith('/api'),
     message: { error: 'Too many requests, please try again later.' }
   });
   app.use(generalLimiter);
 
   // 4. Stricter Rate Limiter for AI consultation (max 60 requests per minute per IP)
-  const consultationLimiter = rateLimit({
+  const consultationLimiter = createSafeLimiter({
     windowMs: 60 * 1000,
     max: 60,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => getClientIP(req),
-    skip: (req) => isLoopbackIP(getClientIP(req)),
-    validate: false,
+    keyGenerator: (req: express.Request) => getClientIP(req),
+    skip: (req: express.Request) => isLoopbackIP(getClientIP(req)),
     message: { error: 'Too many consultation requests, please try again in a moment.' }
   });
 
@@ -890,6 +946,15 @@ app.use(express.json({ limit: '15kb' }));
       console.error("Consultation route error:", routeError);
       res.status(500).json({ error: routeError.message || "Route processing error" });
     }
+  });
+
+  // Global Express error handler to prevent raw serverless crashes
+  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+    console.error('[Adnane Auto Unhandled Server Error]:', err);
+    if (res.headersSent) {
+      return next(err);
+    }
+    res.status(500).json({ error: err?.message || 'Internal Server Error' });
   });
 
 export default app;
