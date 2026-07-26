@@ -1,8 +1,0 @@
-{
-  "name": "Adnane Auto Marrakech",
-  "description": "الموقع الرسمي لمعرض Adnane Auto لبيع وشراء واستبدال السيارات المستعملة في مراكش. Site officiel de Adnane Auto pour l'achat, la vente et la reprise de voitures d'occasion à Marrakech.",
-  "requestFramePermissions": [],
-  "majorCapabilities": [
-    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
-  ]
-}
